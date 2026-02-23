@@ -1,146 +1,214 @@
 import os
-import json
+import math
+import subprocess
+from PIL import Image, ImageDraw, ImageFont
 from docx import Document
 from docx.shared import Inches, Pt, Cm
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+from docx.oxml.shared import qn
+from docx.oxml import OxmlElement
 
 
 class DocxService:
-    def __init__(self, templates, json_file, output_dir):
-
-        self.templates = templates
-        self.json_file = json_file
+    def __init__(self, output_dir: str):
         self.output_dir = output_dir
 
-        # Загружаем данные из JSON-файла
-        with open(self.json_file, "r", encoding="utf-8") as file:
-            self.replacements = json.load(file)
-
-    def replace_text_in_paragraph(self, paragraph, data):
-        full_text = "".join(run.text for run in paragraph.runs)
-        modified_text = full_text
-
-        for key, value in data.items():
-            modified_text = modified_text.replace(f"[{key}]", str(value))
-
-        if full_text != modified_text:
-            for run in paragraph.runs:
-                run.clear()
-
-            lines = modified_text.split("\n")
-            for i, line in enumerate(lines):
-                new_run = paragraph.add_run(line.strip())
-                new_run.font.name = "Calibri"
-                if i < len(lines) - 1:
-                    new_run.add_break()
-
-    def process_document(self, doc):
-        """Проходит по абзацам и таблицам документа и выполняет замену текста."""
-        for paragraph in doc.paragraphs:
-            self.replace_text_in_paragraph(paragraph, self.replacements)
-
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for paragraph in cell.paragraphs:
-                        self.replace_text_in_paragraph(paragraph, self.replacements)
-
-    def create_document(self, template_path, output_filename, qr_code_path):
-        """Создает документ с QR-кодом, логотипом и рамкой в подвале."""
-        doc = Document(template_path)
-
-        section = doc.sections[0]
-        section.footer_distance = Cm(0.5) # Немного отступим от края
-        section.left_margin = Cm(1.5)
-        section.right_margin = Cm(2)
-
+    @staticmethod
+    def _section_has_footer(section) -> bool:
         footer = section.footer
-        
-        # Очищаем старые параграфы в футере, чтобы не было лишних отступов
         for p in footer.paragraphs:
-            p_element = p._element
-            p_element.getparent().remove(p_element)
+            if p.text.strip():
+                return True
+        return bool(footer.tables)
 
-        # Создаем таблицу для красивой рамки (1 строка, 2 колонки)
-        table = footer.add_table(rows=1, cols=2, width=Inches(7))
-        table.autofit = False
-        
-        # --- МАГИЯ РАМКИ (Пунктирная или сплошная) ---
-        # Чтобы сделать рамку как на картинке, нужно задать границы ячейкам
-        for row in table.rows:
-            for cell in row.cells:
-                for side in ['top', 'left', 'bottom', 'right']:
-                    from docx.oxml.shared import qn
-                    from docx.oxml import OxmlElement
-                    tcPr = cell._element.get_or_add_tcPr()
-                    borders = tcPr.find(qn('w:tcBorders'))
-                    if borders is None:
-                        borders = OxmlElement('w:tcBorders')
-                        tcPr.append(borders)
-                    border = OxmlElement(f'w:{side}')
-                    border.set(qn('w:val'), 'dotted') # 'dotted' для пунктира или 'single' для сплошной
-                    border.set(qn('w:sz'), '4')       # толщина
-                    border.set(qn('w:color'), 'A6A6A6') # серый цвет
-                    borders.append(border)
+    @staticmethod
+    def _clear_footer(footer):
+        fp = footer._element
+        for child in list(fp):
+            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if tag in ("tbl", "p", "sdt"):
+                fp.remove(child)
 
-        qr_cell = table.cell(0, 0)
-        text_cell = table.cell(0, 1)
+    def _build_footer_image(self, qr_code_path: str, logo_path: str | None, out_path: str):
+        DPI = 300
+        # Размер в дюймах → пикселях при 300dpi
+        W_in, H_in = 3.2, 0.75
+        W = int(W_in * DPI)
+        H = int(H_in * DPI)
 
-        qr_cell.width = Inches(0.9)
-        text_cell.width = Inches(5.5)
+        PAD = int(0.08 * DPI)      # отступ контента от рамки
+        RADIUS = int(0.12 * DPI)   # скругление углов
+        BORDER = 2                 # толщина линии рамки в px
+        COLOR = (50, 110, 190)
+        DASH = int(0.09 * DPI)
+        GAP  = int(0.05 * DPI)
 
-        # 1. Вставляем QR-код
-        qr_paragraph = qr_cell.paragraphs[0]
-        qr_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-        run_qr = qr_paragraph.add_run()
-        run_qr.add_picture(qr_code_path, width=Inches(0.7))
+        img = Image.new("RGB", (W, H), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
 
-        # 2. Вставляем текст и логотип
-        text_paragraph = text_cell.paragraphs[0]
-        text_paragraph.paragraph_format.space_before = Pt(2)
-        
-        # Первая строка
-        run1 = text_paragraph.add_run("Подписи ЭЦП проверены НУЦ РК")
-        run1.font.name = "Calibri"
-        run1.font.size = Pt(8)
-        
-        # Перенос на вторую строку
-        text_paragraph.add_run("\n") 
-        
-        # Вторая строка: Текст + ЛОГОТИП
-        run2 = text_paragraph.add_run("Документ подписан в сервис ")
-        run2.font.name = "Calibri"
-        run2.font.size = Pt(8)
+        # --- Белый фон со скруглёнными углами ---
+        def fill_rounded(draw, x0, y0, x1, y1, r, color):
+            draw.rectangle([x0+r, y0, x1-r, y1], fill=color)
+            draw.rectangle([x0, y0+r, x1, y1-r], fill=color)
+            for cx, cy in [(x0+r, y0+r), (x1-r, y0+r), (x0+r, y1-r), (x1-r, y1-r)]:
+                draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color)
 
-        logo_path = "uploads/dcx logo png.png"
-        if os.path.exists(logo_path):
-            run_logo = text_paragraph.add_run()
-            # Вставляем картинку прямо в строку
-            run_logo.add_picture(logo_path, width=Inches(0.4)) 
-        else:
-            run_err = text_paragraph.add_run("dcx.kz")
-            run_err.font.name = "Calibri"
-            run_err.font.size = Pt(8)
+        fill_rounded(draw, 0, 0, W-1, H-1, RADIUS, (255, 255, 255))
 
-        # Обработка основного текста документа (замена данных из ERPNext)
-        self.process_document(doc)
+        # --- Пунктирная рамка ---
+        def dashed_line(draw, p1, p2, dash, gap, color, width):
+            x1, y1 = p1; x2, y2 = p2
+            length = math.hypot(x2-x1, y2-y1)
+            if length == 0: return
+            dx, dy = (x2-x1)/length, (y2-y1)/length
+            pos, on = 0, True
+            while pos < length:
+                end = min(pos + (dash if on else gap), length)
+                if on:
+                    draw.line(
+                        [(int(x1+dx*pos), int(y1+dy*pos)), (int(x1+dx*end), int(y1+dy*end))],
+                        fill=color, width=width
+                    )
+                pos, on = end, not on
 
-        output_path = os.path.join(self.output_dir, output_filename)
-        doc.save(output_path)
-        return output_path
-    
+        def dashed_arc(draw, cx, cy, r, a_start, a_end, dash_deg, gap_deg, color, width):
+            a, on = a_start, True
+            while a < a_end:
+                seg = min(a + (dash_deg if on else gap_deg), a_end)
+                if on:
+                    pts = [(int(cx + r*math.cos(math.radians(t))),
+                            int(cy + r*math.sin(math.radians(t))))
+                           for t in range(int(a), int(seg)+1, 2)]
+                    if len(pts) >= 2:
+                        draw.line(pts, fill=color, width=width)
+                a, on = seg, not on
 
-    def generate_documents(self, qr_code_path):
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir)
+        b = BORDER
+        r = RADIUS
+        x0, y0, x1, y1 = b, b, W-b-1, H-b-1
+        D, G = DASH, GAP
+        DA, GA = 20, 12  # градусы для дуг
 
-        created_files = []
-        for template in self.templates:
-            if os.path.exists(template):
-                output_filename = f"processed_{os.path.basename(template)}"
-                path = self.create_document(template, output_filename, qr_code_path)
-                created_files.append(path)
+        dashed_line(draw, (x0+r, y0), (x1-r, y0), D, G, COLOR, b)
+        dashed_line(draw, (x0+r, y1), (x1-r, y1), D, G, COLOR, b)
+        dashed_line(draw, (x0, y0+r), (x0, y1-r), D, G, COLOR, b)
+        dashed_line(draw, (x1, y0+r), (x1, y1-r), D, G, COLOR, b)
+        dashed_arc(draw, x0+r, y0+r, r, 180, 270, DA, GA, COLOR, b)
+        dashed_arc(draw, x1-r, y0+r, r, 270, 360, DA, GA, COLOR, b)
+        dashed_arc(draw, x1-r, y1-r, r,   0,  90, DA, GA, COLOR, b)
+        dashed_arc(draw, x0+r, y1-r, r,  90, 180, DA, GA, COLOR, b)
 
-        return created_files
+        # --- QR-код ---
+        QR_SIZE = H - PAD*2
+        qr = Image.open(qr_code_path).convert("RGBA").resize((QR_SIZE, QR_SIZE), Image.LANCZOS)
+        qr_x = PAD + int(0.02*DPI)
+        qr_y = PAD
+        bg = Image.new("RGB", (QR_SIZE, QR_SIZE), (255, 255, 255))
+        bg.paste(qr, mask=qr.split()[3])
+        img.paste(bg, (qr_x, qr_y))
 
+        # --- Шрифт ---
+        font_size = int(0.13 * DPI)  # ~11pt при 300dpi
+        try:
+            fp = "C:/Windows/Fonts/arial.ttf"
+            if not os.path.exists(fp):
+                fp = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+            font = ImageFont.truetype(fp, font_size)
+        except Exception:
+            font = ImageFont.load_default()
 
+        # --- Текст ---
+        line1 = "Подписи ЭЦП проверены НУЦ РК"
+        line2 = "Документ подписан в сервис "
+        text_color = (0, 0, 0)
+
+        lh = font.getbbox("A")[3]  # высота строки
+        gap_lines = int(0.03 * DPI)
+        total_h = lh * 2 + gap_lines
+        text_x = qr_x + QR_SIZE + int(0.1 * DPI)
+        text_y = (H - total_h) // 2
+
+        draw.text((text_x, text_y), line1, font=font, fill=text_color)
+        line2_y = text_y + lh + gap_lines
+        draw.text((text_x, line2_y), line2, font=font, fill=text_color)
+
+        # --- Логотип ---
+        if logo_path and os.path.exists(logo_path):
+            logo_h = int(lh * 1.5)
+            logo = Image.open(logo_path).convert("RGBA")
+            logo_w = int(logo.width * logo_h / logo.height)
+            logo = logo.resize((logo_w, logo_h), Image.LANCZOS)
+            logo_x = text_x + int(draw.textlength(line2, font=font))
+            logo_y = line2_y + (lh - logo_h) // 2
+            img.paste(logo, (logo_x, logo_y), logo)
+
+        img.save(out_path, "PNG", dpi=(DPI, DPI))
+        return W_in, H_in  # возвращаем дюймы
+
+    def _add_qr_footer(self, footer, qr_code_path: str, logo_path: str | None = None):
+        if not footer.paragraphs:
+            footer._element.append(OxmlElement("w:p"))
+
+        for p in footer.paragraphs:
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            pPr = p._element.get_or_add_pPr()
+            jc = OxmlElement("w:jc")
+            jc.set(qn("w:val"), "right")
+            old_jc = pPr.find(qn("w:jc"))
+            if old_jc is not None:
+                pPr.remove(old_jc)
+            pPr.append(jc)
+
+        img_path = os.path.join(self.output_dir, "_footer_img.png")
+        w_in, h_in = self._build_footer_image(qr_code_path, logo_path, img_path)
+
+        p = footer.paragraphs[0]
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT
+        p.add_run().add_picture(img_path, width=Inches(w_in))
+
+    def process_docx(self, template_path: str, output_docx_path: str,
+                     qr_code_path: str, logo_path: str | None = None) -> str:
+        doc = Document(template_path)
+        for section in doc.sections:
+            section.different_first_page_header_footer = False
+            section.footer_distance = Cm(0.3)
+            has_footer = self._section_has_footer(section)
+            sectPr = section._sectPr
+            for ref in sectPr.findall(qn("w:footerReference")):
+                sectPr.remove(ref)
+            self._clear_footer(section.footer)
+            self._add_qr_footer(section.footer, qr_code_path, logo_path)
+            print(f"[DocxService] Футер {'заменён' if has_footer else 'добавлен'}.")
+        doc.save(output_docx_path)
+        return output_docx_path
+
+    def convert_to_pdf(self, docx_path: str) -> str:
+        soffice = r"C:\Program Files\LibreOffice\program\soffice.exe"
+        if not os.path.exists(soffice):
+            soffice = "libreoffice"
+        result = subprocess.run(
+            [soffice, "--headless", "--convert-to", "pdf",
+             "--outdir", self.output_dir, docx_path],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"LibreOffice ошибка:\n{result.stderr}")
+        base_name = os.path.splitext(os.path.basename(docx_path))[0]
+        pdf_path = os.path.join(self.output_dir, f"{base_name}.pdf")
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"PDF не найден: {pdf_path}")
+        return pdf_path
+
+    def process_and_convert(self, template_path: str, qr_code_path: str,
+                            logo_path: str | None = None) -> str:
+        base_name = os.path.splitext(os.path.basename(template_path))[0]
+        tmp_docx = os.path.join(self.output_dir, f"_tmp_{base_name}.docx")
+        self.process_docx(template_path, tmp_docx, qr_code_path, logo_path)
+        pdf_path = self.convert_to_pdf(tmp_docx)
+        try:
+            os.remove(tmp_docx)
+            os.remove(os.path.join(self.output_dir, "_footer_img.png"))
+        except OSError:
+            pass
+        return pdf_path
