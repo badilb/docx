@@ -67,20 +67,21 @@ class DocxService:
         
         # --- МАГИЯ РАМКИ (Пунктирная или сплошная) ---
         # Чтобы сделать рамку как на картинке, нужно задать границы ячейкам
-        for cell in table.cells:
-            for side in ['top', 'left', 'bottom', 'right']:
-                from docx.oxml.shared import qn
-                from docx.oxml import OxmlElement
-                tcPr = cell._element.get_or_add_tcPr()
-                borders = tcPr.find(qn('w:tcBorders'))
-                if borders is None:
-                    borders = OxmlElement('w:tcBorders')
-                    tcPr.append(borders)
-                border = OxmlElement(f'w:{side}')
-                border.set(qn('w:val'), 'dotted') # 'dotted' для пунктира или 'single' для сплошной
-                border.set(qn('w:sz'), '4')       # толщина
-                border.set(qn('w:color'), 'A6A6A6') # серый цвет
-                borders.append(border)
+        for row in table.rows:
+            for cell in row.cells:
+                for side in ['top', 'left', 'bottom', 'right']:
+                    from docx.oxml.shared import qn
+                    from docx.oxml import OxmlElement
+                    tcPr = cell._element.get_or_add_tcPr()
+                    borders = tcPr.find(qn('w:tcBorders'))
+                    if borders is None:
+                        borders = OxmlElement('w:tcBorders')
+                        tcPr.append(borders)
+                    border = OxmlElement(f'w:{side}')
+                    border.set(qn('w:val'), 'dotted') # 'dotted' для пунктира или 'single' для сплошной
+                    border.set(qn('w:sz'), '4')       # толщина
+                    border.set(qn('w:color'), 'A6A6A6') # серый цвет
+                    borders.append(border)
 
         qr_cell = table.cell(0, 0)
         text_cell = table.cell(0, 1)
@@ -128,7 +129,7 @@ class DocxService:
         doc.save(output_path)
         return output_path
     
-    
+
     def generate_documents(self, qr_code_path):
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
