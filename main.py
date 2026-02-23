@@ -25,7 +25,7 @@ async def generate_documents(request: GenerateRequest):
     templates = [
         os.path.join(config.UPLOAD_DIR, file)
         for file in os.listdir(config.UPLOAD_DIR)
-        if file.endswith(".docx")
+        if file.endswith(".docx") and not file.startswith("~$")  # Игнорируем временные файлы Word
     ]
 
     if not templates:

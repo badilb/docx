@@ -1,5 +1,4 @@
 import os
-import docx
 import json
 from docx import Document
 from docx.shared import Inches, Pt, Cm
@@ -47,55 +46,89 @@ class DocxService:
                         self.replace_text_in_paragraph(paragraph, self.replacements)
 
     def create_document(self, template_path, output_filename, qr_code_path):
-        """Создает новый документ на основе шаблона и заменяет текст."""
+        """Создает документ с QR-кодом, логотипом и рамкой в подвале."""
         doc = Document(template_path)
 
         section = doc.sections[0]
-        section.footer_distance = Cm(0)
+        section.footer_distance = Cm(0.5) # Немного отступим от края
         section.left_margin = Cm(1.5)
         section.right_margin = Cm(2)
 
         footer = section.footer
-        footer.add_paragraph()
-        table = footer.add_table(rows=1, cols=2, width=Inches(9))
+        
+        # Очищаем старые параграфы в футере, чтобы не было лишних отступов
+        for p in footer.paragraphs:
+            p_element = p._element
+            p_element.getparent().remove(p_element)
+
+        # Создаем таблицу для красивой рамки (1 строка, 2 колонки)
+        table = footer.add_table(rows=1, cols=2, width=Inches(7))
         table.autofit = False
+        
+        # --- МАГИЯ РАМКИ (Пунктирная или сплошная) ---
+        # Чтобы сделать рамку как на картинке, нужно задать границы ячейкам
+        for cell in table.cells:
+            for side in ['top', 'left', 'bottom', 'right']:
+                from docx.oxml.shared import qn
+                from docx.oxml import OxmlElement
+                tcPr = cell._element.get_or_add_tcPr()
+                borders = tcPr.find(qn('w:tcBorders'))
+                if borders is None:
+                    borders = OxmlElement('w:tcBorders')
+                    tcPr.append(borders)
+                border = OxmlElement(f'w:{side}')
+                border.set(qn('w:val'), 'dotted') # 'dotted' для пунктира или 'single' для сплошной
+                border.set(qn('w:sz'), '4')       # толщина
+                border.set(qn('w:color'), 'A6A6A6') # серый цвет
+                borders.append(border)
 
         qr_cell = table.cell(0, 0)
         text_cell = table.cell(0, 1)
 
-        qr_cell.width = Inches(1)
-        text_cell.width = Inches(6)
+        qr_cell.width = Inches(0.9)
+        text_cell.width = Inches(5.5)
 
-        if footer.paragraphs:
-            for paragraph in footer.paragraphs:
-                if not paragraph.text.strip():
-                    p = paragraph._element
-                    p.getparent().remove(p)
-
-
+        # 1. Вставляем QR-код
         qr_paragraph = qr_cell.paragraphs[0]
-        run = qr_paragraph.add_run()
-        run.add_picture(qr_code_path, width=Inches(0.7))
+        qr_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        run_qr = qr_paragraph.add_run()
+        run_qr.add_picture(qr_code_path, width=Inches(0.7))
 
+        # 2. Вставляем текст и логотип
         text_paragraph = text_cell.paragraphs[0]
-        text_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
-        text_paragraph.paragraph_format.left_indent = Inches(0)
-        text_paragraph.paragraph_format.space_before = Pt(0)
-        text_paragraph.paragraph_format.space_after = Pt(0)
+        text_paragraph.paragraph_format.space_before = Pt(2)
+        
+        # Первая строка
+        run1 = text_paragraph.add_run("Подписи ЭЦП проверены НУЦ РК")
+        run1.font.name = "Calibri"
+        run1.font.size = Pt(8)
+        
+        # Перенос на вторую строку
+        text_paragraph.add_run("\n") 
+        
+        # Вторая строка: Текст + ЛОГОТИП
+        run2 = text_paragraph.add_run("Документ подписан в сервис ")
+        run2.font.name = "Calibri"
+        run2.font.size = Pt(8)
 
-        run = text_paragraph.add_run(
-            "Данный документ подписан электронной цифровой подписью Удостоверяющего центра НУЦ Республики Казахстан "
-            "в системе электронного документооборота ТОО 'Рога и Копыта' «DocX». Проверить подлинность электронного "
-            "документа Вы можете по ссылке https://tesla.kz/verify, указав идентификатор – iF9jFZPp."
-        )
-        run.font.name = "Calibri"
-        run.font.size = Pt(8)
+        logo_path = "uploads/dcx logo png.png"
+        if os.path.exists(logo_path):
+            run_logo = text_paragraph.add_run()
+            # Вставляем картинку прямо в строку
+            run_logo.add_picture(logo_path, width=Inches(0.4)) 
+        else:
+            run_err = text_paragraph.add_run("dcx.kz")
+            run_err.font.name = "Calibri"
+            run_err.font.size = Pt(8)
 
+        # Обработка основного текста документа (замена данных из ERPNext)
         self.process_document(doc)
 
         output_path = os.path.join(self.output_dir, output_filename)
         doc.save(output_path)
         return output_path
+    
+    
     def generate_documents(self, qr_code_path):
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
